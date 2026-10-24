@@ -1,0 +1,3 @@
+PyQt6>=6.5
+edge-tts>=7.0
+mutagen>=1.47
