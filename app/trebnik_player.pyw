@@ -17,9 +17,11 @@
      склоняется автоматически (по умолчанию — Максим);
    • ссылки на псалмы и евангелия вместо встроенных цитат
      (в церковнославянском виде);
-   • локальный синтез аудио через edge-tts: священник — голос
-     «Дмитрий», хор и пояснения — «Светлана», скорость по умолчанию
-     0.8, MP3, один файл на часть;
+   • локальный синтез аудио с выбором движка и голосов: на роль
+     священника и на роль хора пользователь назначает любой
+     из 17 проверенных голосов (Microsoft онлайн — Дмитрий,
+     Светлана и др.; офлайн — Silero и Piper);
+     скорость по умолчанию 0.8, MP3/WAV, один файл на часть;
    • караоке: подсветка читаемого места при прослушивании.
 
  Запуск:  python trebnik_player.pyw   (или двойной щелчок в Windows)
@@ -30,9 +32,11 @@ import os
 import re
 import sys
 import json
+import time
 import asyncio
 import hashlib
 import traceback
+import urllib.request
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
 
@@ -47,7 +51,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QDoubleSpinBox, QFileDialog, QMessageBox, QDialog,
                              QStatusBar, QSplitter, QRadioButton, QButtonGroup,
                              QGroupBox, QStyle, QSpacerItem, QSizePolicy,
-                             QFrame)
+                             QFrame, QCheckBox, QPlainTextEdit)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 APP_TITLE = "Требникъ — Отчитка"
@@ -77,10 +81,82 @@ SERVICE_FILES = {
 }
 REFERENCES_FILE = os.path.join(TEXTS_DIR, "references.txt")
 
-VOICE_D = "ru-RU-DmitryNeural"     # священник / заклинатель
-VOICE_S = "ru-RU-SvetlanaNeural"   # хор, предстоящие, пояснения
+VOICE_D = "ru-RU-DmitryNeural"     # священник / заклинатель (совместимость)
+VOICE_S = "ru-RU-SvetlanaNeural"   # хор, предстоящие (совместимость)
 ROLE_NAME = {"Д": "Священник", "С": "Хор"}
 CH_PER_SEC = {"Д": 12.0, "С": 12.3}   # символов в секунду при скорости 0.8
+
+# ═════════════════════════════════════════════════════════════════════
+#  ГОЛОСА — 17 шт. (проверены синтезом, ASR и формантами F1/F2).
+#  Запись: (ключ, имя, пол, движок, голос движка, дефект «Ии», примечание)
+#    движок: "edge" — Microsoft edge-tts, онлайн, MP3, скорость = rate
+#            "silero" — офлайн (pip install silero), WAV 48 кГц
+#            "piper" — офлайн (pip install piper-tts), WAV 22 кГц
+#    дефект «Ии» = True: голос читает «Иисусе» как «Эсусе»; лечится
+#    подменой «Ии→Йи» (только в тексте синтеза, на экране не меняется).
+#  Роли назначает пользователь: любой голос на любую роль, любого пола.
+# ═════════════════════════════════════════════════════════════════════
+VOICES = [
+    ("dmitry",   "Дмитрий",  "М", "edge", "ru-RU-DmitryNeural",            True,  ""),
+    ("svetlana", "Светлана", "Ж", "edge", "ru-RU-SvetlanaNeural",          True,  ""),
+    ("andrew",   "Эндрю",    "М", "edge", "en-US-AndrewMultilingualNeural", True,  "коверкает «о рабе твоем»"),
+    ("brian",    "Брайан",   "М", "edge", "en-US-BrianMultilingualNeural", False, "коверкает «о рабе твоем»"),
+    ("ava",      "Ава",      "Ж", "edge", "en-US-AvaMultilingualNeural",   False, "коверкает «о рабе твоем»"),
+    ("emma",     "Эмма",      "Ж", "edge", "en-US-EmmaMultilingualNeural",  True,  ""),
+    ("ostap",    "Остап",    "М", "edge", "uk-UA-OstapNeural",             False, "украинское произношение (г→ґ, ы→и)"),
+    ("polina",   "Полина",   "Ж", "edge", "uk-UA-PolinaNeural",            False, "украинское произношение (г→ґ, ы→и)"),
+    ("kseniya",  "Ксения",   "Ж", "silero", ("v4_ru", "kseniya"),          False, "лучший голос проверки: «Иисусе», «рабе» — чисто"),
+    ("xenia",    "xenia v5", "Ж", "silero", ("v5_ru", "xenia"),           False, "местами спотыкается"),
+    ("aidar",    "Айдар",    "М", "silero", ("v4_ru", "aidar"),            True,  ""),
+    ("eugene",   "Евгений",  "М", "silero", ("v4_ru", "eugene"),           True,  ""),
+    ("aidar5",   "Айдар v5", "М", "silero", ("v5_ru", "aidar"),            True,  ""),
+    ("pdmitri",  "Дмитрий",  "М", "piper", "dmitri",                       True,  "эксперим.: глотает слоги во фразах"),
+    ("pruslan",  "Руслан",   "М", "piper", "ruslan",                       False, "эксперим.: глотает слоги во фразах"),
+    ("pdenis",   "Денис",    "М", "piper", "denis",                        False, "эксперим.: глотает слоги во фразах"),
+    ("pirina",   "Ирина",     "Ж", "piper", "irina",                        False, "эксперим.: глотает слоги во фразах"),
+]
+ENGINE_TAG = {"edge": "MS", "silero": "Silero", "piper": "Piper"}
+ENGINE_EXT = {"edge": ".mp3", "silero": ".wav", "piper": ".wav"}
+ENGINE_SR = {"edge": 0, "silero": 48000, "piper": 22050}   # 0 = MP3-поток
+ENGINE_PKG = {"silero": "silero", "piper": "piper"}    # имена импорта
+PIP_NAME = {"silero": "silero", "piper": "piper-tts"}   # имена pip-пакетов
+
+# Ревизия текстовых правок для кэша аудио. Увеличивать при каждой смене
+# tts_clean (ударения, подмены) или разметки [Д]/[С] — чтобы старые
+# закэшированные файлы считались устаревшими и пересинтезировались.
+TEXT_FIX_REV = "3"
+
+
+def voice_by_key(key):
+    for v in VOICES:
+        if v[0] == key:
+            return v
+    return VOICES[0]
+
+
+def package_ok(engine):
+    """Установлен ли пакет офлайн-движка."""
+    try:
+        import importlib.util as ilu
+        return ilu.find_spec(ENGINE_PKG.get(engine, "")) is not None
+    except Exception:
+        return False
+
+
+def voice_label(v):
+    return "%s · %s · %s" % (v[1], ENGINE_TAG[v[3]], v[2])
+
+
+def voice_tooltip(v):
+    tip = {"edge": "Microsoft edge-tts, онлайн (интернет нужен при синтезе)",
+           "silero": "Silero, офлайн (pip install silero)",
+           "piper": "Piper, офлайн (pip install piper-tts), экспериментальный"}[v[3]]
+    tip += ("\nДефект: «Иисусе» читает как «Эсусе» —"
+            " лечится подменой «Ии→Йи»" if v[5] else
+            "\n«Иисусе» читает правильно, подмена не нужна")
+    if v[6]:
+        tip += "\nПримечание: " + v[6]
+    return tip
 
 # ═════════════════════════════════════════════════════════════════════════
 #  ТРАНСЛИТЕРАЦИЯ ИМЕНИ ФАЙЛА
@@ -366,19 +442,40 @@ def html_escape(s: str) -> str:
 # ═════════════════════════════════════════════════════════════════════════
 #  ПОДГОТОВКА ТЕКСТА К СИНТЕЗУ
 # ═════════════════════════════════════════════════════════════════════════
-def tts_clean(text: str) -> str:
+def tts_clean(text: str, fix_ii: bool = True, stress_marks: bool = False) -> str:
     """Защита от произнесения буквы: твёрдый знак вычищаем полностью,
     фразы-названия букв удаляем. «ь» остаётся — TTS её не читает.
 
-    «Ии» в начале слова (Иисусе, Иисуса…) движок произносит как «Эсусе»
-    (проверено акустически: F2 первого гласного падает с ~2500 до ~1600 Гц).
-    Начальное «Й» даёт правильное «Йи-»; на экране текст не меняется —
-    замена только для синтеза."""
+    fix_ii: часть голосов (в т.ч. «Дмитрий» И «Светлана» — проверено
+    акустически) произносит «Ии» в начале слова как «э-и»: «Иисусе» →
+    «Эсусе». Начальное «Й» даёт правильное «Йи-». Замена применяется
+    ТОЛЬКО к тексту синтеза — на экране и в файлах текст канонический.
+    Голосам без дефекта (например, Silero «Ксения») fix_ii=False —
+    для них текст не меняется вовсе.
+
+    stress_marks: только движку edge (Microsoft), у которого движок
+    сам ставит ударения по своей догадке. Знак U+0301 проверен
+    синтезом и ASR 2026-10-26:
+      • «рабе» → «ра́бе»: без знака конец слова читается с ударением
+        и «э»-окраской («рабЭ» — то, что слышно как «Рабэ»), со знаком
+        ударение правильно уходит на «рА» (профиль энергии 1.88→2.62);
+      • «Иисус…» → «Иису́с…» («Йису́с…» при fix_ii): церковное
+        ударение «Иису́се» на «у».
+    Вариант «рабье» отвергнут: ASR слышит лишнее «й» («рабьйе»).
+    Движку Silero метки не нужны (ставит ударения сам, put_accent)
+    и не ставятся; Piper — тоже без меток."""
     text = text.replace("ъ", "").replace("Ъ", "")
     for phrase in ("твёрдый знак", "твердый знак", "мягкий знак"):
         text = re.sub(r"(?i)[,«\s]*%s\s*[,»]?\.?" % phrase, "", text)
-    text = re.sub(r"\bИисус", "Йисус", text)
-    text = re.sub(r"\bиисус", "йисус", text)
+    if fix_ii:
+        sub = "Йису\u0301с" if stress_marks else "Йисус"
+        text = re.sub(r"\bИисус", sub, text)
+        text = re.sub(r"\bиисус", sub.lower(), text)
+    elif stress_marks:
+        text = re.sub(r"\bИисус", "Иису\u0301с", text)
+        text = re.sub(r"\bиисус", "иису\u0301с", text)
+    if stress_marks:
+        text = re.sub(r"\bрабе\b", "ра\u0301бе", text)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
@@ -424,8 +521,16 @@ def split_long(text: str, limit: int = 850) -> List[str]:
 
 
 def build_chunks(part: Part, name: str, gender: str,
-                 limit: int = 850) -> List[Tuple[str, str]]:
-    """[(роль, текст)] → серии подряд идущих строк одной роли ≤ limit знаков."""
+                 limit: int = 850,
+                 fix_by_role: Optional[Dict[str, bool]] = None,
+                 stress_marks: bool = False
+                 ) -> List[Tuple[str, str]]:
+    """[(роль, текст)] → серии подряд идущих строк одной роли ≤ limit знаков.
+
+    fix_by_role: {"Д": bool, "С": bool} — нужна ли подмена «Ии→Йи»
+    каждой роли (зависит от выбранного голоса роли).
+    stress_marks: ставить ли ударения «ра́бе» и «Иису́с» (нужно движку
+    edge; Silero/Piper — нет)."""
     chunks: List[Tuple[str, str]] = []
     cur_role, cur_buf = None, []
 
@@ -437,7 +542,9 @@ def build_chunks(part: Part, name: str, gender: str,
         cur_role, cur_buf = None, []
 
     for role, raw in part.lines:
-        text = tts_clean(resolve_tokens(raw, name, gender))
+        text = tts_clean(resolve_tokens(raw, name, gender),
+                         fix_ii=(fix_by_role or {}).get(role, True),
+                         stress_marks=stress_marks)
         if not text:
             continue
         if role != cur_role or sum(len(t) for t in cur_buf) + len(text) > limit:
@@ -452,14 +559,14 @@ def part_signature(chunks, name, gender, speed, vd, vs):
     h = hashlib.md5()
     for role, text in chunks:
         h.update((role + "|" + text + "\n").encode("utf-8"))
-    h.update(f"|{name}|{gender}|{speed}|{vd}|{vs}".encode("utf-8"))
+    h.update(f"|{name}|{gender}|{speed}|{vd}|{vs}|rev:{TEXT_FIX_REV}".encode("utf-8"))
     return h.hexdigest()[:16]
 
 
-def part_filename(part: Optional[Part], service: Service) -> str:
+def part_filename(part: Optional[Part], service: Service, ext: str = ".mp3") -> str:
     if part is None:
-        return "00_polnostyu.mp3"
-    return "%02d_%s.mp3" % (part.num, translit(part.title))
+        return "00_polnostyu" + ext
+    return "%02d_%s%s" % (part.num, translit(part.title), ext)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -474,8 +581,189 @@ def mp3_duration_ms(path: str) -> Optional[int]:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  ПОТОК СИНТЕЗА (edge-tts)
+#  ПОТОК СИНТЕЗА (edge — онлайн / silero, piper — офлайн)
 # ═════════════════════════════════════════════════════════════════════════
+SILERO_MODELS = {}
+PIPER_MODELS = {}
+PIPER_DIR = os.path.join(AUDIO_DIR, "piper_models")
+
+
+def silero_load(model_name):
+    """Загрузка (и кэш) модели Silero; дружелюбные ошибки по стадиям."""
+    if model_name not in SILERO_MODELS:
+        if not package_ok("silero"):
+            raise RuntimeError(
+                "Пакет silero не найден тем Python'ом, который запускает плеер:\n"
+                "  %s\n\n"
+                "Установите из терминала именно этим Python'ом\n"
+                "(подставьте путь из сообщения выше):\n"
+                "  1) ... -m pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
+                "     — компактная CPU-сборка torch ~200 МБ; без этого шага pip\n"
+                "       потянет гигабайтную сборку с CUDA;\n"
+                "  2) ... -m pip install silero\n\n"
+                "Модель ≈38 МБ скачается один раз при первом синтезе\n"
+                "(нужен доступ к github.com и models.silero.ai)." % sys.executable)
+        try:
+            from silero import silero_tts
+            m = silero_tts(language="ru", speaker=model_name)
+        except ImportError as e:
+            raise RuntimeError(
+                "Не импортируется silero/torch:\n  %s\n\n"
+                "Частые причины на Windows:\n"
+                " • пакеты ставились ДРУГИМ Python'ом — переустановите тем же:\n"
+                "   «%s» -m pip install --force-reinstall silero\n"
+                " • нет Microsoft Visual C++ Redistributable (из-за него torch\n"
+                "   падает с «DLL load failed») — поставьте vc_redist.x64.exe\n"
+                "   с сайта Microsoft и перезапустите плеер;\n"
+                " • повреждён torch — «%s» -m pip install --force-reinstall "
+                "torch --index-url https://download.pytorch.org/whl/cpu"
+                % (e, sys.executable, sys.executable))
+        except Exception as e:
+            raise RuntimeError(
+                "Не удалось скачать/загрузить модель Silero:\n  %s\n\n"
+                "На первом синтезе нужно скачать ≈38 МБ с github.com\n"
+                "и models.silero.ai — проверьте интернет (или антивирус,\n"
+                "который мог заблокировать загрузку), затем повторите." % e)
+        if isinstance(m, tuple):
+            m = m[0]
+        SILERO_MODELS[model_name] = m
+    return SILERO_MODELS[model_name]
+
+
+def silero_pcm(text: str, model_name: str, speaker: str,
+               sr: int = ENGINE_SR["silero"]) -> bytes:
+    """Синтез Silero → PCM int16 моно."""
+    model = silero_load(model_name)
+    t = model.apply_tts(text=text, speaker=speaker, sample_rate=sr,
+                        put_accent=True, put_yo=True)
+    data = t.detach().cpu().numpy()
+    if data.ndim > 1:
+        data = data[0]
+    return (data * 32767).clip(-32768, 32767).astype("<i2").tobytes()
+
+
+def piper_load(name: str):
+    """Загрузка (с скачиванием при первом обращении) модели Piper."""
+    if name not in PIPER_MODELS:
+        if not package_ok("piper"):
+            raise RuntimeError(
+                "Пакет piper-tts не найден тем Python'ом, который запускает плеер:\n"
+                "  %s\n\n"
+                "Установите из терминала именно этим Python'ом:\n"
+                "  ... -m pip install piper-tts\n\n"
+                "Модель ≈60 МБ скачается один раз при первом синтезе." % sys.executable)
+        os.makedirs(PIPER_DIR, exist_ok=True)
+        onnx = os.path.join(PIPER_DIR, "ru_RU-%s-medium.onnx" % name)
+        jsn = onnx + ".json"
+        # два зеркала: huggingface.co и hf-mirror.com (недоступность HF —
+        # частая причина сбоев загрузки; зеркало пробуется автоматически)
+        bases = ("https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                 "ru/ru_RU/%s/medium/ru_RU-%s-medium.%s",
+                 "https://hf-mirror.com/rhasspy/piper-voices/resolve/main/"
+                 "ru/ru_RU/%s/medium/ru_RU-%s-medium.%s")
+        try:
+            if not os.path.isfile(onnx):
+                _urlretrieve_any(bases, name, "onnx", onnx)
+            if not os.path.isfile(jsn):
+                _urlretrieve_any(bases, name, "onnx.json", jsn)
+        except Exception as e:
+            raise RuntimeError(
+                "Не удалось скачать модель Piper:\n  %s\n\n"
+                "Нужен доступ к huggingface.co (или зеркалу hf-mirror.com,\n"
+                "пробуется сам), ≈60 МБ. Проверьте интернет и повторите." % e)
+        try:
+            from piper import PiperVoice
+            PIPER_MODELS[name] = PiperVoice.load(onnx)
+        except Exception as e:
+            raise RuntimeError(
+                "PiperVoice.load не смог открыть модель (%s).\n"
+                "Полная трассировка — в окне ошибки (кнопка «Скопировать всё»)\n"
+                "и в файле error_log.txt рядом с плеером — пришлите её." % e)
+    return PIPER_MODELS[name]
+
+
+def _urlretrieve_any(bases, name, suffix, dest):
+    last = None
+    for base in bases:
+        try:
+            urllib.request.urlretrieve(base % (name, name, suffix), dest)
+            return
+        except Exception as e:
+            last = e
+    raise last
+
+
+def piper_pcm(text: str, name: str, length_scale: float = 1.25
+              ) -> Tuple[bytes, int]:
+    """Синтез Piper → (PCM int16 моно, sample_rate).
+    Совместим и с piper-tts >= 1.3 (SynthesisConfig), и с 1.2.0
+    (keyword-аргументы): у API двух версий разные сигнатуры."""
+    import io
+    import wave
+    voice = piper_load(name)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        try:
+            from piper import SynthesisConfig      # piper-tts >= 1.3
+            voice.synthesize_wav(text, w,
+                                 syn_config=SynthesisConfig(
+                                     length_scale=length_scale))
+        except ImportError:                        # старый piper-tts 1.2.0
+            voice.synthesize(text, w, length_scale=length_scale)
+    buf.seek(0)
+    with wave.open(buf, "rb") as r:
+        return r.readframes(r.getnframes()), r.getframerate()
+
+
+def wav_write(path: str, pcm: bytes, sr: int):
+    import wave
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm)
+
+
+def wav_read_frames(path: str) -> Tuple[bytes, int]:
+    import wave
+    with wave.open(path, "rb") as w:
+        return w.readframes(w.getnframes()), w.getframerate()
+
+
+def edge_apply_v2() -> bool:
+    """Переводит edge-tts на новый протокол v2 (октябрь 2026).
+
+    Microsoft закрывает старый WebSocket-эндпоинт
+    speech.platform.bing.com: обновлённые серверы отвечают 403
+    либо завершают сессию без аудио («No audio was received»).
+    Новый протокол: api.msedgeservices.com, ключ передаётся
+    параметром Ocp-Apim-Subscription-Key, Sec-MS-GEC-Version
+    2-155.0.4283.45, UA Edge 155. Идемпотентно; False — если
+    патчить нечего (установленный edge-tts уже сам на v2)."""
+    try:
+        import edge_tts.communicate as comm
+    except ImportError:
+        return False
+    if "speech.platform.bing.com" not in getattr(comm, "WSS_URL", ""):
+        return False                     # уже v2 / другая структура
+    token = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"   # публичный ключ Read Aloud
+    try:
+        from edge_tts.constants import TRUSTED_CLIENT_TOKEN as token
+    except ImportError:
+        pass
+    comm.WSS_URL = ("wss://api.msedgeservices.com/tts/cognitiveservices"
+                    "/websocket/v1?Ocp-Apim-Subscription-Key=" + token)
+    comm.SEC_MS_GEC_VERSION = "2-155.0.4283.45"
+    ua = comm.WSS_HEADERS.get("User-Agent", "")
+    m = re.search(r"Chrome/(\d+)", ua)
+    if m and int(m.group(1)) < 155:
+        comm.WSS_HEADERS["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+            " Edg/155.0.0.0")
+    return True
+
+
 class SynthWorker(QThread):
     sig_progress = pyqtSignal(int, int, str)   # сделано, всего, подпись
     sig_part = pyqtSignal(int, str)            # индекс части, путь
@@ -483,7 +771,7 @@ class SynthWorker(QThread):
     sig_finished = pyqtSignal(bool)            # True = отменено
 
     def __init__(self, service, indexes, name, gender, speed, out_dir,
-                 parent=None):
+                 voice_d, voice_s, fix_d, fix_s, parent=None):
         super().__init__(parent)
         self.service = service
         self.indexes = indexes           # список индексов частей или None → все
@@ -491,6 +779,15 @@ class SynthWorker(QThread):
         self.gender = gender
         self.speed = speed
         self.out_dir = out_dir
+        self.v_d = voice_by_key(voice_d)   # голос роли «священник»
+        self.v_s = voice_by_key(voice_s)   # голос роли «хор»
+        self.engine = self.v_d[3]
+        self.fix_by_role = {"Д": bool(fix_d), "С": bool(fix_s)}
+        # ударения «ра́бе» и «Иису́с» — только движку edge (проверено ASR;
+        # Silero ставит ударения сам, Piper — экспериментальный)
+        self.stress_marks = self.engine == "edge"
+        self.ext = ENGINE_EXT[self.engine]
+        self.sr = ENGINE_SR[self.engine]   # 0 = MP3-поток (edge)
         self.with_full = indexes is None or indexes == "all"
         self._cancel = False
 
@@ -509,16 +806,21 @@ class SynthWorker(QThread):
         finally:
             self.sig_finished.emit(self._cancel)
 
-    async def _chunk_bytes(self, text: str, role: str, rate: str) -> bytes:
+    def _sig_voices(self):
+        return (self.v_d[0] + ("|fix" if self.fix_by_role["Д"] else ""),
+                self.v_s[0] + ("|fix" if self.fix_by_role["С"] else ""))
+
+    async def _chunk_edge(self, text: str, voice_id: str, rate: str) -> bytes:
         import edge_tts
-        voice = VOICE_D if role == "Д" else VOICE_S
+        if not text or not text.strip():
+            return b""                    # нечего озвучивать — тишина
         last_err = None
         for attempt in range(4):
             if self._cancel:
                 raise Cancelled()
             try:
                 buf = bytearray()
-                comm = edge_tts.Communicate(text, voice, rate=rate, pitch="-2Hz")
+                comm = edge_tts.Communicate(text, voice_id, rate=rate, pitch="-2Hz")
                 async for piece in comm.stream():
                     if piece["type"] == "audio":
                         buf.extend(piece["data"])
@@ -529,13 +831,52 @@ class SynthWorker(QThread):
                 raise
             except Exception as e:
                 last_err = e
-                await asyncio.sleep(1.2 * (attempt + 1))
-        raise RuntimeError("edge-tts: %s" % last_err)
+            # Microsoft закрывает старый протокол Read Aloud (окт. 2026):
+            # часть серверов уже отвечает 403/без аудио. Первый сбой —
+            # переключаемся на протокол v2 и продолжаем попытки.
+            edge_apply_v2()
+            await asyncio.sleep(1.2 * (attempt + 1))
+        raise RuntimeError(
+            "edge-tts: %s\n\n"
+            "Онлайн-движок Microsoft не ответил. Старый протокол\n"
+            "speech.platform.bing.com закрыт (с октября 2026 серверы\n"
+            "переведены на api.msedgeservices.com — плеер пробует его\n"
+            "автоматически). Если ошибка повторяется:\n"
+            "  • проверьте интернет и не блокирует ли файрвол/антивирус\n"
+            "    исходящие wss://-соединения;\n"
+            "  • обновите пакет тем же Python'ом:\n"
+            "    «%s» -m pip install -U edge-tts\n"
+            "    (в будущих версиях новый протокол — из коробки);\n"
+            "  • либо выберите офлайн-голоса (Silero/Piper) — им для\n"
+            "    синтеза интернет не нужен.\n\n"
+            "Уже синтезированные части сохранены в папке audio/."
+            % (last_err, sys.executable))
+
+    def _chunk_offline(self, text: str, v) -> bytes:
+        if self._cancel:
+            raise Cancelled()
+        if self.engine == "silero":
+            model_name, speaker = v[4]
+            return silero_pcm(text, model_name, speaker, self.sr)
+        pcm, got_sr = piper_pcm(text, v[4],
+                                max(0.6, min(2.2, 1.0 / max(0.4, self.speed))))
+        if got_sr != self.sr:
+            self.sr = got_sr     # все ru_RU-medium = 22.05 кГц, но на всякий случай
+        return pcm
 
     async def _run(self):
         os.makedirs(self.out_dir, exist_ok=True)
+        if self.engine != "edge":
+            # предзагрузка моделей обеих ролей — быстрый отказ + кэш
+            for v in dict.fromkeys((self.v_d, self.v_s)):
+                if self.engine == "silero":
+                    silero_load(v[4][0])
+                else:
+                    piper_load(v[4])
         pause = self._load_pause()
         rate = "%+d%%" % round((self.speed - 1.0) * 100)
+        is_mp3 = self.engine == "edge"
+        vd, vs = self._sig_voices()
 
         idxs = list(range(len(self.service.parts))) if self.indexes in (None, "all") \
             else list(self.indexes)
@@ -547,11 +888,13 @@ class SynthWorker(QThread):
             if self._cancel:
                 return
             part = self.service.parts[i]
-            fname = part_filename(part, self.service)
+            fname = part_filename(part, self.service, self.ext)
             fpath = os.path.join(self.out_dir, fname)
-            chunks = build_chunks(part, self.name, self.gender)
+            chunks = build_chunks(part, self.name, self.gender,
+                                  fix_by_role=self.fix_by_role,
+                                  stress_marks=self.stress_marks)
             sig = part_signature(chunks, self.name, self.gender,
-                                 self.speed, VOICE_D, VOICE_S)
+                                 self.speed, vd, vs)
             if os.path.isfile(fpath) and cache.get(fname) == sig:
                 done += 1
                 self.sig_progress.emit(done, total, "готово: %s" % fname)
@@ -562,12 +905,18 @@ class SynthWorker(QThread):
             for j, (role, text) in enumerate(chunks):
                 if self._cancel:
                     return
-                data = await self._chunk_bytes(text, role, rate)
-                audio.extend(data)
+                v = self.v_d if role == "Д" else self.v_s
+                if is_mp3:
+                    audio.extend(await self._chunk_edge(text, v[4], rate))
+                else:
+                    audio.extend(self._chunk_offline(text, v))
                 if pause and j < len(chunks) - 1:
                     audio.extend(pause)
-            with open(fpath, "wb") as fh:
-                fh.write(audio)
+            if is_mp3:
+                with open(fpath, "wb") as fh:
+                    fh.write(audio)
+            else:
+                wav_write(fpath, bytes(audio), self.sr)
             cache[fname] = sig
             self._write_cache(cache)
             done += 1
@@ -576,35 +925,58 @@ class SynthWorker(QThread):
 
         if self.with_full and not self._cancel:
             self.sig_progress.emit(done, total, "склейка полного файла")
-            full_path = os.path.join(self.out_dir, part_filename(None, self.service))
-            with open(full_path, "wb") as out:
-                for i in idxs:
-                    p = os.path.join(self.out_dir,
-                                     part_filename(self.service.parts[i], self.service))
-                    with open(p, "rb") as fh:
-                        out.write(fh.read())
-                    if i != idxs[-1] and pause:
-                        out.write(pause)
-                        out.write(pause)
-            cache[part_filename(None, self.service)] = "full-" + self._full_sig()
+            full_path = os.path.join(self.out_dir,
+                                     part_filename(None, self.service, self.ext))
+            if is_mp3:
+                with open(full_path, "wb") as out:
+                    for k, i in enumerate(idxs):
+                        p = os.path.join(self.out_dir, part_filename(
+                            self.service.parts[i], self.service, self.ext))
+                        with open(p, "rb") as fh:
+                            out.write(fh.read())
+                        if k != len(idxs) - 1 and pause:
+                            out.write(pause)
+                            out.write(pause)
+            else:
+                import wave as _w
+                with _w.open(full_path, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(self.sr)
+                    for k, i in enumerate(idxs):
+                        if self._cancel:
+                            return
+                        p = os.path.join(self.out_dir, part_filename(
+                            self.service.parts[i], self.service, self.ext))
+                        frames, _sr = wav_read_frames(p)
+                        w.writeframes(frames)
+                        if k != len(idxs) - 1:
+                            w.writeframes(pause)
+                            w.writeframes(pause)
+            cache[part_filename(None, self.service, self.ext)] = "full-" + self._full_sig()
             self._write_cache(cache)
             done += 1
             self.sig_part.emit(-1, full_path)
 
     def _full_sig(self):
         sigs = []
+        vd, vs = self._sig_voices()
         for part in self.service.parts:
-            chunks = build_chunks(part, self.name, self.gender)
+            chunks = build_chunks(part, self.name, self.gender,
+                                  fix_by_role=self.fix_by_role,
+                                  stress_marks=self.stress_marks)
             sigs.append(part_signature(chunks, self.name, self.gender,
-                                       self.speed, VOICE_D, VOICE_S))
+                                       self.speed, vd, vs))
         return hashlib.md5("|".join(sigs).encode()).hexdigest()[:16]
 
     def _load_pause(self):
-        for cand in (os.path.join(APP_DIR, "pause_400ms.mp3"),):
-            if os.path.isfile(cand):
-                with open(cand, "rb") as fh:
-                    return fh.read()
-        return b""
+        if self.engine == "edge":
+            for cand in (os.path.join(APP_DIR, "pause_400ms.mp3"),):
+                if os.path.isfile(cand):
+                    with open(cand, "rb") as fh:
+                        return fh.read()
+            return b""
+        return b"\x00\x00" * int(0.4 * self.sr)
 
     def _read_cache(self):
         p = os.path.join(self.out_dir, ".cache.json")
@@ -666,6 +1038,44 @@ class KaraokeTrack:
 # ═════════════════════════════════════════════════════════════════════════
 #  ДИАЛОГ ССЫЛКИ (псалом / евангелие / молитва)
 # ═════════════════════════════════════════════════════════════════════════
+class ErrorDialog(QDialog):
+    """Окно ошибки с ВЫДЕЛЯЕМЫМ текстом: Ctrl+C, ПКМ → Копировать,
+    кнопка «Скопировать всё» — чтобы можно было переслать ошибку."""
+
+    def __init__(self, title, text, note="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(760, 500)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+        self.edit = QPlainTextEdit(text)
+        self.edit.setReadOnly(True)
+        f = QFont("Consolas")
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        f.setPointSize(9)
+        self.edit.setFont(f)
+        lay.addWidget(self.edit, 1)
+        self.noteLabel = QLabel(note)
+        self.noteLabel.setWordWrap(True)
+        lay.addWidget(self.noteLabel)
+        bar = QHBoxLayout()
+        bar.addStretch(1)
+        btnCopy = QPushButton("Скопировать всё")
+        btnCopy.clicked.connect(self.copy_all)
+        btnClose = QPushButton("Закрыть")
+        btnClose.clicked.connect(self.accept)
+        btnClose.setDefault(True)
+        bar.addWidget(btnCopy)
+        bar.addWidget(btnClose)
+        lay.addLayout(bar)
+
+    def copy_all(self):
+        QApplication.clipboard().setText(self.edit.toPlainText())
+        self.noteLabel.setText(
+            "Скопировано в буфер обмена — можно вставить (Ctrl+V) в письмо.")
+
+
 class ReferenceDialog(QDialog):
     def __init__(self, title, text, parent=None):
         super().__init__(parent)
@@ -700,6 +1110,8 @@ QLineEdit, QDoubleSpinBox, QComboBox {
     padding: 5px 8px; color: #e8e3d5; min-height: 22px;
 }
 QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #c9a227; }
+QCheckBox { color: #cfc7b0; }
+QCheckBox::indicator { width: 14px; height: 14px; }
 QComboBox QAbstractItemView {
     background: #1e2129; border: 1px solid #3a3f4d;
     selection-background-color: #4a3c14; selection-color: #e6c35c;
@@ -727,6 +1139,12 @@ QListWidget::item:hover { background: #23262f; }
 QTextBrowser {
     background: #101216; border: 1px solid #2b2f3a; border-radius: 6px;
     padding: 10px; color: #e8e3d5; font-size: 15px;
+    selection-background-color: #5d4b1a; selection-color: #f2dfa0;
+}
+QPlainTextEdit {
+    background: #101216; border: 1px solid #2b2f3a; border-radius: 6px;
+    padding: 8px; color: #e8e3d5; font-size: 12px;
+    selection-background-color: #5d4b1a; selection-color: #f2dfa0;
 }
 a { color: #e6c35c; }
 QProgressBar {
@@ -756,11 +1174,29 @@ QRadioButton::indicator:checked { background: #c9a227; border-color: #c9a227; }
 SPEAKER_STYLE = {"Д": "#d2b55a", "С": "#7f96b8"}
 
 
+class Browser(QTextBrowser):
+    """Текстовая панель с пунктом «Копировать всё» в контекстном меню
+    (когда ничего не выделено) — выделение на тёмной теме теперь видно."""
+
+    def contextMenuEvent(self, ev):
+        menu = self.createStandardContextMenu()
+        if not self.textCursor().hasSelection():
+            menu.addSeparator()
+            act = menu.addAction("Копировать всё")
+            act.triggered.connect(
+                lambda: QApplication.clipboard().setText(self.toPlainText()))
+        menu.exec(ev.globalPos())
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(1240, 820)
+        avail = self.screen().availableGeometry() if self.screen() \
+            else QApplication.primaryScreen().availableGeometry()
+        # окно подстраивается под экран пользователя (напр. 1366×768)
+        self.resize(min(1180, avail.width() - 70),
+                    min(730, avail.height() - 70))
         self.settings = QSettings("TrebnikOtchitka", "trebnik_player")
 
         # состояние
@@ -774,6 +1210,14 @@ class MainWindow(QMainWindow):
         self.speed = float(self.settings.value("speed", 0.8))
         self.view = str(self.settings.value("view", "tts"))
         self.sel = int(self.settings.value("sel", -1))   # -1 = полностью
+        # голоса ролей: любой голос на любую роль, пол — на выбор пользователя
+        self.voice_d = str(self.settings.value("voice_d", "dmitry"))
+        self.voice_s = str(self.settings.value("voice_s", "svetlana"))
+        if self.voice_d not in [v[0] for v in VOICES]:
+            self.voice_d = "dmitry"
+        if self.voice_s not in [v[0] for v in VOICES]:
+            self.voice_s = "svetlana"
+        self.fix_ii = self.settings.value("fix_ii", True, type=bool)
 
         self.player = None
         self.track = None          # KaraokeTrack
@@ -874,6 +1318,42 @@ class MainWindow(QMainWindow):
         bar2.addStretch(1)
         rv.addLayout(bar2)
 
+        # строка 2b: голоса ролей (священник / хор) — любой из 17 голосов
+        bar2v = QHBoxLayout()
+        bar2v.setSpacing(8)
+        bar2v.addWidget(QLabel("Священник:"))
+        self.comboD = QComboBox()
+        self.comboS = QComboBox()
+        for combo in (self.comboD, self.comboS):
+            for v in VOICES:
+                combo.addItem(voice_label(v), v[0])
+                combo.setItemData(combo.count() - 1, voice_tooltip(v),
+                                  Qt.ItemDataRole.ToolTipRole)
+            combo.setMinimumContentsLength(14)
+            combo.currentIndexChanged.connect(lambda _=0: self.on_voice_changed())
+        self.comboD.setToolTip("Голос роли «священник» — любой, пол не важен;\n"
+                               "обычай — мужской, но выбор за вами")
+        self.comboS.setToolTip("Голос роли «хор» (также наставления и рубрики).\n"
+                               "Оба голоса должны быть из одного движка")
+        bar2v.addWidget(self.comboD)
+        bar2v.addWidget(QLabel("Хор:"))
+        bar2v.addWidget(self.comboS)
+        self.chkFix = QCheckBox("Ии→Йи (лечить дефект)")
+        self.chkFix.setToolTip(
+            "Часть голосов (Дмитрий, Светлана, Эндрю, Эмма, Айдар,\n"
+            "Евгений и др.) читает «Иисусе» как «Эсусе» — проверено\n"
+            "акустически. Подмена «Ии→Йи» делает произношение правильным\n"
+            "и применяется ТОЛЬКО к тексту синтеза: на экране и в файлах\n"
+            "текст канонический. Голосам без дефекта подмена не нужна.\n\n"
+            "Кроме неё, для голосов Microsoft автоматически ставятся\n"
+            "знаки ударения: «ра́бе» (без знака слышится «рабЭ»/«Рабэ»,\n"
+            "со знаком — правильное «рАбе») и «Иису́се» с ударением на «у»,\n"
+            "как в церковном чтении. Silero ударения ставит сам.")
+        self.chkFix.toggled.connect(self.on_fix_toggled)
+        bar2v.addWidget(self.chkFix)
+        bar2v.addStretch(1)
+        rv.addLayout(bar2v)
+
         # строка 3: плеер
         bar3 = QHBoxLayout()
         bar3.setSpacing(8)
@@ -913,7 +1393,7 @@ class MainWindow(QMainWindow):
         rv.addLayout(bar4)
 
         # текст
-        self.browser = QTextBrowser()
+        self.browser = Browser()
         self.browser.setOpenLinks(False)
         self.browser.anchorClicked.connect(self.on_anchor)
         rv.addWidget(self.browser, 1)
@@ -956,6 +1436,11 @@ class MainWindow(QMainWindow):
             self.rbM.setChecked(True)
         self.btnTts.setChecked(self.view == "tts")
         self.btnCs.setChecked(self.view == "cs")
+        keys = [v[0] for v in VOICES]
+        self.comboD.setCurrentIndex(max(0, keys.index(self.voice_d)))
+        self.comboS.setCurrentIndex(max(0, keys.index(self.voice_s)))
+        self.chkFix.setChecked(self.fix_ii)
+        self.apply_voice_ui()
         self.refresh_list()
 
     def refresh_list(self):
@@ -1035,6 +1520,61 @@ class MainWindow(QMainWindow):
         if self.player:
             self.audio_out.setVolume(v / 100.0)
         self.settings.setValue("volume", v)
+
+    # ── голоса ролей ───────────────────────────────────────────────────────
+    def fix_map(self):
+        """{роль: применять ли подмену «Ии»} — по голосу роли и галочке."""
+        v1 = voice_by_key(self.voice_d)
+        v2 = voice_by_key(self.voice_s)
+        return {"Д": v1[5] and self.fix_ii,
+                "С": v2[5] and self.fix_ii}
+
+    def sig_pair(self):
+        fm = self.fix_map()
+        return (self.voice_d + ("|fix" if fm["Д"] else ""),
+                self.voice_s + ("|fix" if fm["С"] else ""))
+
+    def apply_voice_ui(self):
+        v1 = voice_by_key(self.voice_d)
+        v2 = voice_by_key(self.voice_s)
+        engine = v1[3]
+        # скорость: MS = rate, Piper = length_scale, Silero — свой темп
+        self.speedSpin.setEnabled(engine in ("edge", "piper"))
+        self.speedSpin.setToolTip(
+            "Скорость чтения" +
+            (" (голоса Microsoft)" if engine == "edge" else
+             " (Piper: длина фонем)" if engine == "piper" else
+             " — движок Silero читает в естественном темпе"))
+        # галочка нужна, только если хотя бы один голос роли с дефектом
+        self.chkFix.setVisible(v1[5] or v2[5])
+
+    def on_voice_changed(self, _=None):
+        vd = self.comboD.currentData()
+        vs = self.comboS.currentData()
+        if vd and vd != self.voice_d:
+            self.voice_d = vd
+            self.settings.setValue("voice_d", vd)
+        if vs and vs != self.voice_s:
+            self.voice_s = vs
+            self.settings.setValue("voice_s", vs)
+        self.apply_voice_ui()
+        self.update_audio_status()
+        self.check_audio_stale()
+        v1 = voice_by_key(self.voice_d)
+        v2 = voice_by_key(self.voice_s)
+        if v1[3] != v2[3]:
+            self.status_show("⚠ Голоса ролей из разных движков (%s и %s) — "
+                             "выберите оба из одного движка, иначе синтез "
+                             "недоступен." % (ENGINE_TAG[v1[3]], ENGINE_TAG[v2[3]]))
+        else:
+            self.status_show("Озвучка: священник — %s, хор — %s" % (v1[1], v2[1]))
+
+    def on_fix_toggled(self, on):
+        if self.fix_ii == bool(on):
+            return
+        self.fix_ii = bool(on)
+        self.settings.setValue("fix_ii", self.fix_ii)
+        self.check_audio_stale()
 
     def on_seek(self, v):
         if self.player and self.player.duration():
@@ -1146,7 +1686,9 @@ class MainWindow(QMainWindow):
     def audio_file(self):
         svc = self.services[self.svc_key]
         part = self.current_part()
-        return os.path.join(AUDIO_DIR, svc.dir_tag, part_filename(part, svc))
+        engine = voice_by_key(self.voice_d)[3]
+        return os.path.join(AUDIO_DIR, svc.dir_tag,
+                            part_filename(part, svc, ENGINE_EXT[engine]))
 
     def update_audio_status(self):
         path = self.audio_file()
@@ -1172,17 +1714,32 @@ class MainWindow(QMainWindow):
         part = self.current_part()
         if part is None:
             return
-        chunks = build_chunks(part, self.name, self.gender)
+        fm = self.fix_map()
+        vd, vs = self.sig_pair()
+        chunks = build_chunks(part, self.name, self.gender, fix_by_role=fm,
+                              stress_marks=voice_by_key(self.voice_d)[3] == "edge")
         sig = part_signature(chunks, self.name, self.gender,
-                             self.speed, VOICE_D, VOICE_S)
+                             self.speed, vd, vs)
         if cache.get(os.path.basename(path)) != sig:
-            self.status_show("Имя, род или скорость изменились — "
+            self.status_show("Имя, род, скорость или голоса изменились — "
                              "пересинтезируйте, чтобы аудио им совпадало.")
 
     # проигрывание
     def on_play(self):
         if self.player is None:
             QMessageBox.warning(self, "Плеер", "QtMultimedia недоступен.")
+            return
+        state = self.player.playbackState()
+        # идёт воспроизведение → пауза (раньше кнопка ошибочно
+        # перезапускала файл с начала — "Пауза не работала")
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            return
+        # на паузе → продолжаем с того же места
+        if state == QMediaPlayer.PlaybackState.PausedState:
+            self.player.play()
+            if self.view == "tts":
+                self.karaoke_timer.start()
             return
         if not self.audio_path:
             self.on_gen_part()
@@ -1214,6 +1771,8 @@ class MainWindow(QMainWindow):
     def on_play_state(self, state):
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self.btnPlay.setText("Пауза")
+        elif state == QMediaPlayer.PlaybackState.PausedState:
+            self.btnPlay.setText("Продолжить")
         else:
             self.btnPlay.setText("Слушать")
             if state == QMediaPlayer.PlaybackState.StoppedState:
@@ -1245,8 +1804,20 @@ class MainWindow(QMainWindow):
             return
         svc = self.services[self.svc_key]
         out_dir = os.path.join(AUDIO_DIR, svc.dir_tag)
+        v1 = voice_by_key(self.voice_d)
+        v2 = voice_by_key(self.voice_s)
+        if v1[3] != v2[3]:
+            QMessageBox.warning(self, "Разные движки",
+                "Священник и хор назначены голосам разных движков\n"
+                "(%s и %s) — склеить аудио невозможно.\n\n"
+                "Выберите оба голоса из одного движка."
+                % (ENGINE_TAG[v1[3]], ENGINE_TAG[v2[3]]))
+            return
+        fm = self.fix_map()
         self.worker = SynthWorker(svc, indexes, self.name, self.gender,
-                                 self.speed, out_dir)
+                                  self.speed, out_dir,
+                                  self.voice_d, self.voice_s,
+                                  fm["Д"], fm["С"])
         self.worker.sig_progress.connect(self.on_synth_progress)
         self.worker.sig_part.connect(self.on_synth_part)
         self.worker.sig_error.connect(self.on_synth_error)
@@ -1257,8 +1828,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(1)
         self.worker.start()
-        self.status_show("Синтез запущен: %s (голоса: Дмитрий + Светлана, "
-                         "скорость %.2f)" % (svc.name, self.speed))
+        self.status_show("Синтез запущен: %s (священник: %s, хор: %s, "
+                         "скорость %.2f)" % (svc.name, v1[1], v2[1], self.speed))
 
     def on_gen_part(self):
         if self.sel == -1:
@@ -1284,8 +1855,15 @@ class MainWindow(QMainWindow):
             self.update_audio_status()
 
     def on_synth_error(self, msg):
-        QMessageBox.critical(self, "Ошибка синтеза",
-                             "Не удалось завершить синтез:\n\n%s" % msg)
+        """Окно ошибки с КОПИРУЕМЫМ текстом (QMessageBox не копировался)
+        и дублем в error_log.txt — теперь ошибку можно переслать целиком."""
+        logp = log_error(msg)
+        note = ("Полный текст также дописан в файл:\n%s\n\n"
+                "Пришлите его целиком — по трассировке видно, на каком шаге\n"
+                "всё упало, и я скажу точное лечение." % logp) if logp else ""
+        ErrorDialog("Ошибка синтеза",
+                    "Не удалось завершить синтез.\n\n%s" % msg, note,
+                    self).exec()
 
     def on_synth_done(self, cancelled):
         self.btnCancel.setVisible(False)
@@ -1318,6 +1896,18 @@ def fmt_ms(ms):
     ms = max(0, int(ms))
     m, s = divmod(ms // 1000, 60)
     return "%02d:%02d" % (m, s)
+
+
+def log_error(text: str) -> Optional[str]:
+    """Дописывает ошибку в error_log.txt рядом с плеером.
+    Возвращает путь файла или None (тогда текст только в окне)."""
+    try:
+        p = os.path.join(APP_DIR, "error_log.txt")
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write("\n[%s]\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        return p
+    except Exception:
+        return None
 
 
 # ═════════════════════════════════════════════════════════════════════════

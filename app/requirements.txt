@@ -1,3 +1,28 @@
-PyQt6>=6.5
+PyQt6>=6.6
+# В октябре 2026 Microsoft закрыл старый протокол Read Aloud
+# (speech.platform.bing.com → api.msedgeservices.com). Плеер
+# переключается на новый протокол автоматически; здесь версия
+# не критична — подойдёт и 7.0, и будущие.
 edge-tts>=7.0
 mutagen>=1.47
+
+# Офлайн-движки — по желанию (голос на роль выбирается в самой программе).
+#
+# ВАЖНО: ставить тем же Python'ом, которым запускается плеер!
+# Вместо «pip install …» надёжнее «python -m pip install …»,
+# где python — тот же интерпретатор (в Windows: путь к python.exe/py.exe).
+#
+# Silero (Ксения, Айдар, Евгений и др.):
+#   1) сначала компактный CPU-torch (~200 МБ), иначе pip потянет
+#      гигабайтную сборку с CUDA:
+#      python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   2) python -m pip install silero
+#   Модель (~38 МБ) скачивается один раз при первом синтезе
+#   (нужен доступ к github.com и models.silero.ai).
+#   Если при запуске падает с «DLL load failed» — поставьте
+#   Microsoft Visual C++ Redistributable (vc_redist.x64.exe).
+#
+# Piper (экспериментальные голоса Денис/Руслан/Ирина и др.):
+#   python -m pip install piper-tts
+#   Модели (~60 МБ) качаются с huggingface.co при первом синтезе;
+#   если HF недоступен — автоматически пробуется зеркало hf-mirror.com.
